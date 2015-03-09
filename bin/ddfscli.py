@@ -302,16 +302,17 @@ def push(program, tag, *files):
     tarballs = program.options.tarballs
     forceon= [] if not program.options.forceon else [program.options.forceon]
 
-    blobs = [] if tarballs else [file for file in files
-                                 if os.path.isfile(file)]
-
+    blobs = []
     for file in files:
         if tarballs:
             for name, buf, size in program.ddfs.tarblobs(file,
+                                                         compress=program.options.compress,
                                                          include=program.options.include,
                                                          exclude=program.options.exclude):
                 print("extracted {0}".format(name))
                 blobs += [(buf, name)]
+        elif os.path.isfile(file):
+            blobs += [file]
         elif os.path.isdir(file):
             if program.options.recursive:
                 blobs += [os.path.join(path, blob)
@@ -319,6 +320,9 @@ def push(program, tag, *files):
                           for blob in blobs]
             else:
                 print("{0} is a directory (not pushing).".format(file))
+        else:
+            raise Exception("{0}: No such file or directory".format(file))
+
     print("pushing...")
     program.ddfs.push(tag, blobs, replicas=replicas, forceon=forceon)
 
@@ -421,14 +425,14 @@ def xcat(program, *urls):
     the blobs reachable from the tags will be printed after any non-tag url[s].
     """
     from itertools import chain
-    from disco.core import classic_iterator
+    from disco.core import result_iterator
     from disco.util import iterify, reify
 
     tags, urls = program.separate_tags(*program.input(*urls))
     stream = reify(program.options.stream)
     reader = program.options.reader
     reader = reify('disco.worker.task_io.chain_reader' if reader is None else reader)
-    for record in classic_iterator(chain(urls, program.blobs(*tags)),
+    for record in result_iterator(chain(urls, program.blobs(*tags)),
                                    input_stream=stream,
                                    reader=reader):
         print('\t'.join('{0}'.format(e) for e in iterify(record)).rstrip())

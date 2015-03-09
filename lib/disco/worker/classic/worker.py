@@ -259,6 +259,7 @@ class Worker(worker.Worker):
             return self.getitem(key, job, jobargs, default)
         has_map = bool(get('map'))
         has_reduce = bool(get('reduce'))
+        reduce_shuffle = bool(get('reduce_shuffle'))
         job_input = get('input', [])
         has_save_results = get('save', False) or get('save_results', False)
 
@@ -289,6 +290,7 @@ class Worker(worker.Worker):
                         'worker': self.bin,
                         'map?': has_map,
                         'reduce?': has_reduce,
+                        'reduce_shuffle?': reduce_shuffle,
                         'nr_reduces': nr_reduces,
                         'save_results': has_save_results})
         return jobdict
@@ -303,11 +305,6 @@ class Worker(worker.Worker):
                 for path, bytes in get(func).items():
                     jobzip.writestr(os.path.join('ext.{0}'.format(func), path), bytes)
         return jobzip
-
-    def should_save_results(self, task, job, jobargs):
-        def get(key):
-            return self.getitem(key, job, jobargs)
-        return get('save_results') and (task.stage == 'map' or get('reduce'))
 
     def run(self, task, job, **jobargs):
         global Task
@@ -422,7 +419,7 @@ class Worker(worker.Worker):
         else:
             streams = self['{0}_output_stream'.format(mode)]
         def open(url):
-            return ClassicFile(url, streams, params)
+            return StreamCombiner(url, streams, params)
         return open
 
 

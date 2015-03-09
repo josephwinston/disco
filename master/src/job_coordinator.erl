@@ -112,6 +112,7 @@ task_started(Coord, TaskId, Worker) ->
                 next_taskid = 0  :: task_id(),
                 next_runid  = 0  :: task_run_id(),
                 input_pid = none :: none | pid(),
+                jehandler        :: pid(),
                 hosts      = gb_sets:empty()  :: disco_gbset(host()),
                 tasks      = gb_trees:empty() :: disco_gbtree(task_id(), task_info()),
                 data_map   = gb_trees:empty() :: disco_gbtree(input_id(), data_info()),
@@ -227,16 +228,17 @@ setup_job(JobPack, JobCoord) ->
     {JobInfo#jobinfo{jobname = JobName, jobfile = JobFile}, Hosts}.
 
 -spec init_state(jobinfo(), [host()]) -> state().
-init_state(#jobinfo{jobname  = _JobName,
+init_state(#jobinfo{jobname  = JobName,
                     schedule = Schedule,
                     inputs   = Inputs,
                     pipeline = Pipeline} = JobInfo, Hosts) ->
     lager:info("initialized job ~p with pipeline ~p and inputs ~p",
-               [_JobName, Pipeline, Inputs]),
+               [JobName, Pipeline, Inputs]),
     gen_server:cast(self(), {start, Inputs}),
     #state{jobinfo    = JobInfo,
            pipeline   = Pipeline,
            schedule   = Schedule,
+           jehandler  = event_server:get_job_event_handler(JobName),
            hosts      = gb_sets:from_list(Hosts)}.
 
 preprocess_inputs(Coord, Inputs) ->
@@ -314,6 +316,7 @@ do_update_nodes(Hosts, S) ->
 do_task_done(TaskId, Host, Result, #state{jobinfo = #jobinfo{jobname = JobName},
                                           tasks   = Tasks,
                                           data_map   = DataMap,
+                                          jehandler  = JEHandler,
                                           stage_info = SI} = S) ->
     #task_info{spec = #task_spec{stage = Stage}}
         = TInfo = jc_utils:task_info(TaskId, Tasks),
@@ -321,24 +324,24 @@ do_task_done(TaskId, Host, Result, #state{jobinfo = #jobinfo{jobname = JobName},
     FEvent = {task_failed, Stage},
     case Result of
         {fatal, F} ->
-            event_server:task_event(ETInfo, {<<"FATAL">>, F}, FEvent),
+            job_event:task_event(JEHandler, ETInfo, {<<"FATAL">>, F}, FEvent),
             kill_job(F),
             SI1 = jc_utils:update_stage_tasks(Stage, TaskId, stop, SI),
             S#state{stage_info = SI1};
         {error, E} ->
-            event_server:task_event(ETInfo, {<<"WARNING">>, E}, FEvent),
+            job_event:task_event(JEHandler, ETInfo, {<<"WARNING">>, E}, FEvent),
             SI1 = jc_utils:update_stage_tasks(Stage, TaskId, stop, SI),
             retry_task(Host, E, TInfo, S#state{stage_info = SI1});
         {input_error, {{input, _}, _}} = E ->
             % If a pipeline input is inaccessible, we cannot re-run
             % the generating task since there isn't one, so we
             % fallback to retry-ing the task.
-            event_server:task_event(ETInfo, {<<"WARNING">>, "Job input failed"},
+            job_event:task_event(JEHandler, ETInfo, {<<"WARNING">>, "Job input failed"},
                                     FEvent),
             SI1 = jc_utils:update_stage_tasks(Stage, TaskId, stop, SI),
             retry_task(Host, E, TInfo, S#state{stage_info = SI1});
         {input_error, {InputId, InputHosts}} = E ->
-            event_server:task_event(ETInfo, {<<"WARNING">>, "Input failed"},
+            job_event:task_event(JEHandler, ETInfo, {<<"WARNING">>, "Input failed"},
                                     FEvent),
             SI1 = jc_utils:update_stage_tasks(Stage, TaskId, stop, SI),
             % We assume here that the disco_worker has validated the
@@ -358,9 +361,9 @@ do_task_done(TaskId, Host, Result, #state{jobinfo = #jobinfo{jobname = JobName},
                     retry_task(Host, E, TInfo, S1)
             end;
         {done, Outputs} ->
-            event_server:task_event(ETInfo,
-                                    disco:format("Received results from ~s", [Host]),
-                                    {task_ready, Stage}),
+            job_event:task_event(JEHandler, ETInfo,
+                                 disco:format("Received results from ~s", [Host]),
+                                 {task_ready, Stage}),
             task_complete(TaskId, Host, Outputs, S)
     end.
 
@@ -410,7 +413,9 @@ retry_task(Host, _Error,
                                         stage   = Stage},
                       failed_count = FailedCnt,
                       failed_hosts = FH} = TInfo,
-           #state{tasks = Tasks, hosts = Cluster} = S) ->
+           #state{tasks = Tasks,
+                  jehandler = JEHandler,
+                  hosts = Cluster} = S) ->
     {ok, MaxFail} = application:get_env(max_failure_rate),
     FC = FailedCnt + 1,
     case FC > MaxFail of
@@ -418,8 +423,9 @@ retry_task(Host, _Error,
             M = disco:format("Task ~s:~B failed ~B times."
                              " At most ~B failures are allowed.",
                              [Stage, TaskId, FC, MaxFail]),
-            event_server:task_event({JobName, Stage, TaskId}, {<<"ERROR">>, M}),
-            kill_job(M);
+            job_event:task_event(JEHandler, {JobName, Stage, TaskId}, {<<"ERROR">>, M}),
+            kill_job(M),
+            S;
         false ->
             JobCoord = self(),
             _ = spawn_link(
@@ -471,22 +477,15 @@ regenerate_input(_WaiterTInfo, {GenTaskId, _} = _InputId,
 
 -spec task_complete(task_id(), host(), [task_output()], state()) -> state().
 task_complete(TaskId, Host, Outputs, S) ->
-    #state{tasks = Tasks, pipeline = P, stage_info = SI} = S1 =
+    #state{tasks = Tasks, pipeline = P} = S1 =
         wakeup_waiters(TaskId, Host, Outputs, S),
     #task_info{spec = #task_spec{stage = Stage}} = jc_utils:task_info(TaskId, Tasks),
-    {NewGroups, ModifiedGroups} = get_grouping_lists(S1, Stage, TaskId, Outputs),
-
-    % It is important that we call get_grouping_lists before setting the task as done.
-    S2 = S1#state{stage_info = jc_utils:update_stage_tasks(Stage, TaskId, done, SI)},
-    #state{stage_info = SI1} = S3 =
-        maybe_submit_tasks(S2, Stage, NewGroups, ModifiedGroups),
-    % The following should be SI (not SI1) because the jc_util function expects
-    % the task not to be in the done list yet.
-    case jc_utils:last_stage_task(Stage, TaskId, SI) and can_finish(P, Stage, SI1) of
+    #state{stage_info = SI} = S2 = submit_concurrent_tasks(S1, Stage, TaskId, Outputs),
+    case can_finish(P, Stage, SI) of
         true -> stage_done(Stage);
         false -> ok
     end,
-    maybe_start_pending(S3).
+    maybe_start_pending(S2).
 
 -spec maybe_start_pending(state()) -> state().
 maybe_start_pending(#state{pending = Pending} = S) ->
@@ -500,17 +499,6 @@ maybe_start_pending(#state{pending = Pending} = S) ->
                 false -> S1
             end
         end, S, Pending).
-
--spec maybe_submit_tasks(state(), stage_name(), [grouped_output()], [grouped_output()]) -> state().
-maybe_submit_tasks(#state{pipeline = P} = S, Stage, NewGroups, ModifiedGroups) ->
-    case pipeline_utils:next_stage(P, Stage) of
-        {Next, Grouping, _} ->
-            {NTasks, STemp} = make_stage_tasks(Next, Grouping, NewGroups, S, {0, []}),
-            STemp1 = do_submit_tasks(first_run, NTasks, STemp),
-            send_outputs_to_consumers(STemp1, ModifiedGroups, Next);
-        done ->
-            S
-    end.
 
 -spec send_outputs_to_consumers(state(), [grouped_output()], stage_name()) -> state().
 send_outputs_to_consumers(#state{stage_info = SI} = S, ModifiedGroups, Stage) ->
@@ -561,22 +549,31 @@ send_outputs_to_consumer(S, TaskId, {_, Inputs}) ->
             S1
     end.
 
--spec get_grouping_lists(state(), stage_name(), task_id(), [task_output()]) ->
-                                  {[grouped_output()], [grouped_output()]}.
-get_grouping_lists(#state{stage_info = SI, pipeline = P} = S, Stage, TaskId, Outputs) ->
+-spec submit_concurrent_tasks(state(), stage_name(), task_id(), [task_output()]) -> state().
+submit_concurrent_tasks(#state{stage_info = SI, pipeline = P} = S, Stage, TaskId, Outputs) ->
     case pipeline_utils:next_stage(P, Stage) of
         done ->
             % there is no tasks in the next stage to be started.
-            {[], []};
-        {_, Grouping, _} ->
+            S#state{stage_info = jc_utils:update_stage_tasks(Stage, TaskId, done, SI)};
+        {_, _, false} ->
+            S#state{stage_info = jc_utils:update_stage_tasks(Stage, TaskId, done, SI)};
+        {Next, Grouping, true} ->
             case jc_utils:stage_info_opt(Stage, SI) of
                 none ->
                     PrevStageOutputs = [{TaskId, Outputs}],
-                    {pipeline_utils:group_outputs(Grouping, PrevStageOutputs), []} ;
+                    NewGroups = pipeline_utils:group_outputs(Grouping, PrevStageOutputs),
+                    ModifiedGroups = [];
                 _ ->
                     PrevStageOutputs = stage_outputs(Stage, S),
-                    pipeline_utils:get_grouping_lists(Grouping, PrevStageOutputs, TaskId, Outputs)
-            end
+                    {NewGroups, ModifiedGroups} =
+                        pipeline_utils:get_grouping_lists(Grouping,
+                                                          PrevStageOutputs,
+                                                          TaskId, Outputs)
+            end,
+            S1 = S#state{stage_info = jc_utils:update_stage_tasks(Stage, TaskId, done, SI)},
+            {NTasks, S2} = make_stage_tasks(Next, Grouping, NewGroups, S1, {0, []}),
+            S3 = do_submit_tasks(first_run, NTasks, S2),
+            send_outputs_to_consumers(S3, ModifiedGroups, Next)
     end.
 
 wakeup_waiters(TaskId, Host, Outputs, #state{tasks = Tasks} = S) ->
@@ -609,8 +606,9 @@ maybe_event_stage_done(Stage, #state{pipeline = P, stage_info = SI} = S) ->
 
 -spec can_finish(pipeline(), stage_name(), disco_gbtree(stage_name(), stage_info())) -> boolean().
 can_finish(P, Stage, SI) ->
+    jc_utils:no_tasks_running(Stage, SI) andalso
     pipeline_utils:all_deps_finished(P, Stage, SI) andalso
-    jc_utils:no_tasks_running(Stage, SI).
+    jc_utils:last_stage_task(Stage, SI).
 
 -spec event_stage_done(stage_name(), state()) -> ok.
 event_stage_done(Stage, #state{jobinfo    = #jobinfo{jobname = JobName},
@@ -646,17 +644,13 @@ do_next_stage(Stage, #state{pipeline = P, stage_info = SI} = S) ->
                 true -> finish_pipeline(Stage, S);
                 false -> S
             end;
-        {Next, Grouping, _} ->
+        {Next, Grouping, false} ->
+            start_next_stage(stage_outputs(Stage, S), Next, Grouping, S);
+        {Next, Grouping, true} ->
             S1 = send_termination_signal(Next, S),
-            case Stage of
-                ?INPUT ->
-                    start_next_stage(stage_outputs(Stage, S1), Next, Grouping, S1);
-                _      ->
-                    case pipeline_utils:group_outputs(Grouping,
-                                                      stage_outputs(Stage, S1)) of
-                        [] -> start_next_stage([], Next, Grouping, S1);
-                        _  -> S1
-                    end
+            case pipeline_utils:group_outputs(Grouping, stage_outputs(Stage, S1)) of
+                [] -> start_next_stage([], Next, Grouping, S1);
+                _  -> S1
             end
     end.
 
@@ -736,6 +730,7 @@ make_stage_tasks(Stage, Grouping, [{G, Inputs}|Rest],
                         tasks = Tasks,
                         schedule    = Schedule,
                         next_taskid = NextTaskId,
+                        jehandler   = JEHandler,
                         stage_info = SI} = S,
                  {TaskNum, Acc}) ->
     S1 = add_inputs_to_data_map(S, Inputs),
@@ -748,6 +743,7 @@ make_stage_tasks(Stage, Grouping, [{G, Inputs}|Rest],
         _     -> pipeline_utils:all_deps_finished(P, Stage, SI)
     end,
     TaskSpec = #task_spec{jobname = JN,
+                          jehandler = JEHandler,
                           stage   = Stage,
                           taskid  = NextTaskId,
                           tasknum = TaskNum,
@@ -802,20 +798,20 @@ do_submit_tasks(_Mode, [], S) -> S;
 do_submit_tasks(Mode, [TaskId | Rest], #state{stage_info = SI,
                                               pipeline   = P,
                                               pending    = Pending,
-                                              jobinfo = #jobinfo{jobname = JobName},
                                               schedule = Schedule,
+                                              jehandler = JEHandler,
                                               tasks      = Tasks} = S) ->
     #task_info{spec = TaskSpec} = jc_utils:task_info(TaskId, Tasks),
     #task_spec{stage = Stage} = TaskSpec,
     case jc_utils:can_run_task(P, Stage, SI, Schedule) of
         false ->
-            event_server:pending_event(JobName, Stage, add),
+            job_event:pending_event(JEHandler, Stage, add),
             do_submit_tasks(Mode, Rest,
                             S#state{pending = gb_sets:add_element({TaskId, Mode}, Pending)});
         true ->
             NewPending = case gb_sets:is_element({TaskId, Mode}, Pending) of
                 true ->
-                    event_server:pending_event(JobName, Stage, remove),
+                    job_event:pending_event(JEHandler, Stage, remove),
                     gb_sets:del_element({TaskId, Mode}, Pending);
                 false -> Pending
             end,

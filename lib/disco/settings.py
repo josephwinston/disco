@@ -141,6 +141,11 @@ Possible settings for Disco are as follows:
                 We are assuming that the listening port is the default graphite
                 port.
 
+        .. envvar:: SYSTEMD_ENABLED
+
+                This adds -noshell to the erlang process. It provides compatibility for running
+                disco using a non-forking process type in the service definition.
+
         .. envvar:: DISCO_WORKER_MAX_MEM
 
                 How much memory can be used by worker in total. Worker calls `resource.setrlimit(RLIMIT_AS, limit) <http://docs.python.org/library/resource.html#resource.setrlimit>`_ to set the limit when it starts. Can be either a percentage of total available memory or an exact number of bytes. Note that ``setrlimit`` behaves differently on Linux and Mac OS X, see *man setrlimit* for more information. Default is ``80%`` i.e. 80% of the total available memory.
@@ -320,6 +325,8 @@ class DiscoSettings(Settings):
 #'PROFILE'
         'DISCO_PROFILE':         "'False'",
         'GRAPHITE_HOST':         "'localhost'",
+# OTHER
+        'SYSTEMD_ENABLED':       "False",
 # PROXY
         'DISCO_PROXY_ENABLED':   "''",
         'DISCO_PROXY':           "''",
@@ -369,15 +376,21 @@ class DiscoSettings(Settings):
         for name in self.must_exist:
             self.safedir(name)
         config = self['DISCO_MASTER_CONFIG']
+        try:
+            import multiprocessing
+            nCpus = multiprocessing.cpu_count()
+        except:
+            nCpus = 1
+
         if not os.path.exists(config):
-            open(config, 'w').write('[["localhost","1"]]')
+            open(config, 'w').write('[["localhost","{}"]]'.format(nCpus))
 
 def job_owner():
     return "%s@%s" % (pwd.getpwuid(os.getuid()).pw_name,
                       socket.gethostname())
 
 def guess_erlang():
-    if os.uname()[0] == 'Darwin':
+    if os.uname()[0] == 'Darwin' and int(os.uname()[2].split('.')[0]) < 14:
         return '/usr/libexec/StartupItemContext erl'
     return 'erl'
 
